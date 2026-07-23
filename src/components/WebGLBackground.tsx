@@ -19,6 +19,17 @@ export default function WebGLBackground() {
     const materialRef = useRef<THREE.PointsMaterial | null>(null);
     const bloomRef = useRef<UnrealBloomPass | null>(null);
     
+    // Performance governor state
+    const governorRef = useRef({
+        lastTime: 0,
+        smoothedMs: 16.7,
+        poorFrames: 0,
+        strongFrames: 0,
+        qualityTier: 2, // 0 = low, 1 = med, 2 = high
+        maxParticles: 20000,
+        currentParticles: 20000
+    });
+
     // Animation states
     const animState = useRef({
         time: 0,
@@ -77,13 +88,17 @@ export default function WebGLBackground() {
         composerRef.current = composer;
 
         // Particle System
-        const particleCount = isHighEnd ? 20000 : 5000;
+        const maxParticles = isHighEnd ? 20000 : 5000;
+        governorRef.current.maxParticles = maxParticles;
+        governorRef.current.currentParticles = maxParticles;
+        governorRef.current.qualityTier = isHighEnd ? 2 : 1;
+
         const geometry = new THREE.BufferGeometry();
-        const positions = new Float32Array(particleCount * 3);
-        const originalPositions = new Float32Array(particleCount * 3);
-        const randoms = new Float32Array(particleCount);
+        const positions = new Float32Array(maxParticles * 3);
+        const originalPositions = new Float32Array(maxParticles * 3);
+        const randoms = new Float32Array(maxParticles);
         
-        for (let i = 0; i < particleCount; i++) {
+        for (let i = 0; i < maxParticles; i++) {
             const r = 20 + Math.random() * 40;
             const theta = Math.random() * Math.PI * 2;
             const z = (Math.random() - 0.5) * 400;
@@ -142,7 +157,31 @@ export default function WebGLBackground() {
 
         // Render loop
         let animationFrameId: number;
-        const renderLoop = () => {
+        const renderLoop = (time: number) => {
+            const gov = governorRef.current;
+            if (gov.lastTime) {
+                const deltaMs = time - gov.lastTime;
+                gov.smoothedMs += (deltaMs - gov.smoothedMs) * 0.05;
+                
+                // Adaptive governor logic
+                gov.poorFrames = gov.smoothedMs > 24 ? gov.poorFrames + 1 : 0;
+                gov.strongFrames = gov.smoothedMs < 15 ? gov.strongFrames + 1 : 0;
+
+                if (gov.poorFrames > 90 && gov.qualityTier > 0) {
+                    gov.qualityTier--;
+                    gov.poorFrames = 0; // cooldown
+                    gov.currentParticles = Math.floor(gov.maxParticles * (gov.qualityTier === 1 ? 0.5 : 0.25));
+                    if (particlesRef.current) particlesRef.current.geometry.setDrawRange(0, gov.currentParticles);
+                }
+                if (gov.strongFrames > 360 && gov.qualityTier < 2) {
+                    gov.qualityTier++;
+                    gov.strongFrames = 0; // cooldown
+                    gov.currentParticles = Math.floor(gov.maxParticles * (gov.qualityTier === 2 ? 1 : 0.5));
+                    if (particlesRef.current) particlesRef.current.geometry.setDrawRange(0, gov.currentParticles);
+                }
+            }
+            gov.lastTime = time;
+
             const state = animState.current;
             state.time += 0.002 * state.speed;
             state.mouseX += (state.targetX - state.mouseX) * 0.05;
@@ -165,7 +204,8 @@ export default function WebGLBackground() {
                     const positions = particles.geometry.attributes.position.array as Float32Array;
                     const originals = particles.geometry.attributes.aOriginalPosition.array as Float32Array;
                     
-                    for (let i = 0; i < particleCount; i++) {
+                    const drawLimit = gov.currentParticles;
+                    for (let i = 0; i < drawLimit; i++) {
                         const i3 = i * 3;
                         const t = state.time + originals[i3+2] * 0.01;
                         const r = 30;
@@ -189,15 +229,16 @@ export default function WebGLBackground() {
                 }
             }
             
-            // Dynamic Bloom Strength based on speed
+            // Dynamic Bloom Strength based on speed and tier
             if (bloomPass) {
-                bloomPass.strength = isHighEnd ? 1.5 + (state.speed * 0.1) : 0.8;
+                const baseStrength = gov.qualityTier === 2 ? 1.5 : gov.qualityTier === 1 ? 1.0 : 0.5;
+                bloomPass.strength = baseStrength + (state.speed * 0.1);
             }
 
             composer.render();
             animationFrameId = requestAnimationFrame(renderLoop);
         };
-        renderLoop();
+        animationFrameId = requestAnimationFrame(renderLoop);
 
         return () => {
             window.removeEventListener('resize', handleResize);

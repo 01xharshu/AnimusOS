@@ -3,10 +3,13 @@ import { useEffect, useRef, useState } from 'react';
 import gsap from 'gsap';
 import { useAppContext, APP_STATE } from '@/context/AppContext';
 import { loreData } from '@/data/loreData';
+import { getMaleVoice } from '@/utils/audioUtils';
+import { mulberry32, stringToSeed } from '@/utils/mathUtils';
 
 export default function LoreLayer() {
     const { currentState, setCurrentState, currentLoreIndex, setCurrentLoreIndex } = useAppContext();
     const cardRef = useRef<HTMLDivElement>(null);
+    const titleRef = useRef<HTMLHeadingElement>(null);
     const [title, setTitle] = useState('');
     const [body, setBody] = useState('');
     const [isPlaying, setIsPlaying] = useState(false);
@@ -19,6 +22,7 @@ export default function LoreLayer() {
         // Decrypt text effect
         const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()_+-=[]{}|;:,.<>?";
         const decrypt = (finalString: string, setFn: (val: string) => void, duration: number = 1500) => {
+            const random = mulberry32(stringToSeed(data.id));
             let iterations = 0;
             const maxIterations = finalString.length * 2;
             const intervalDuration = duration / maxIterations;
@@ -27,7 +31,7 @@ export default function LoreLayer() {
                 setFn(finalString.split('').map((char, index) => {
                     if (index < iterations / 2) return char;
                     if (char === ' ') return ' ';
-                    return chars[Math.floor(Math.random() * chars.length)];
+                    return chars[Math.floor(random() * chars.length)];
                 }).join(''));
 
                 if (iterations >= maxIterations) {
@@ -39,12 +43,19 @@ export default function LoreLayer() {
             return interval;
         };
 
-        if (cardRef.current) {
+        if (cardRef.current && titleRef.current) {
+            // Reset cinematic masks
+            gsap.set(titleRef.current.children, { y: '110%' });
+            setTitle(data.title); // set actual text before mask reveal
+
             gsap.fromTo(cardRef.current, 
                 { opacity: 0, y: 100, scale: 0.9, rotationX: -10 },
                 { opacity: 1, y: 0, scale: 1, rotationX: 0, duration: 0.8, ease: "elastic.out(1, 0.8)",
                   onComplete: () => {
-                      decrypt(data.title, setTitle, 800);
+                      // Cinematic line reveal
+                      if (titleRef.current) {
+                          gsap.to(titleRef.current.children, { y: '0%', duration: 0.6, ease: "power4.out" });
+                      }
                       setTimeout(() => decrypt(data.text, setBody, 2000), 300);
                   }
                 }
@@ -81,9 +92,13 @@ export default function LoreLayer() {
 
         const data = loreData[currentLoreIndex];
         const utterance = new SpeechSynthesisUtterance(data.audio);
-        if (data.theme === "#ffb700") { utterance.pitch = 1.3; utterance.rate = 0.85; }
-        else if (data.theme === "#ff2a2a") { utterance.pitch = 0.7; utterance.rate = 0.95; }
-        else { utterance.pitch = 1; utterance.rate = 0.95; }
+        
+        const maleVoice = getMaleVoice();
+        if (maleVoice) utterance.voice = maleVoice;
+
+        if (data.theme === "#ffb700") { utterance.pitch = 0.8; utterance.rate = 0.85; }
+        else if (data.theme === "#ff2a2a") { utterance.pitch = 0.5; utterance.rate = 0.95; }
+        else { utterance.pitch = 0.7; utterance.rate = 0.95; }
 
         utterance.onstart = () => setIsPlaying(true);
         utterance.onend = () => setIsPlaying(false);
@@ -109,7 +124,11 @@ export default function LoreLayer() {
                         <div className="mono text-xs md:text-sm tracking-[0.4em]" style={{ color: data.theme }}>{data.id}</div>
                         <div className="mono text-xs text-gray-500 tracking-widest">ERA: {data.era}</div>
                     </div>
-                    <h1 className="cinzel text-4xl md:text-6xl font-bold mb-6 tracking-wider">{title}</h1>
+                    
+                    {/* Cinematic Typography Mask */}
+                    <h1 className="cinzel text-4xl md:text-6xl font-bold mb-6 tracking-wider line-mask" ref={titleRef}>
+                        <span>{title}</span>
+                    </h1>
                     
                     <div className="text-lg md:text-xl font-light leading-relaxed text-gray-300 text-justify mb-8 min-h-[12rem]">
                         {body}

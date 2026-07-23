@@ -3,11 +3,14 @@ import { useEffect, useRef, useState } from 'react';
 import gsap from 'gsap';
 import { useAppContext, APP_STATE } from '@/context/AppContext';
 import { gameData, svgHelix } from '@/data/loreData';
+import { getMaleVoice } from '@/utils/audioUtils';
+import { mulberry32, stringToSeed } from '@/utils/mathUtils';
 
 export default function HelixArchive() {
     const { currentState, setCurrentState, currentHelixIndex, setCurrentHelixIndex } = useAppContext();
     const trackRef = useRef<HTMLDivElement>(null);
     const detailLayerRef = useRef<HTMLDivElement>(null);
+    const titleRef = useRef<HTMLHeadingElement>(null);
     const [title, setTitle] = useState('');
     const [body, setBody] = useState('');
     const [isPlaying, setIsPlaying] = useState(false);
@@ -22,8 +25,6 @@ export default function HelixArchive() {
         let isDragging = false;
         let startX = 0;
         let animationFrameId: number;
-
-        const maxScroll = trackRef.current ? trackRef.current.scrollWidth - window.innerWidth : 0;
 
         const handleMouseDown = (e: MouseEvent) => {
             isDragging = true;
@@ -50,19 +51,56 @@ export default function HelixArchive() {
         const renderLoop = () => {
             if (trackRef.current) {
                 targetScrollX = Math.max(0, Math.min(targetScrollX, trackRef.current.scrollWidth - window.innerWidth));
+                
+                // Magnetic snapping logic
+                const tempVelocity = targetScrollX - currentScrollX;
+                if (!isDragging && Math.abs(tempVelocity) < 15) {
+                    const nodes = trackRef.current.querySelectorAll('.helix-node') as NodeListOf<HTMLElement>;
+                    let minDistance = Infinity;
+                    let closestIdealScroll = targetScrollX;
+                    const viewportCenter = currentScrollX + window.innerWidth / 2;
+
+                    nodes.forEach((node) => {
+                        const nodeCenter = node.offsetLeft + node.offsetWidth / 2;
+                        const dist = Math.abs(nodeCenter - viewportCenter);
+                        if (dist < minDistance) {
+                            minDistance = dist;
+                            closestIdealScroll = nodeCenter - window.innerWidth / 2;
+                        }
+                    });
+
+                    // Attraction radius (spring force)
+                    if (minDistance < window.innerWidth * 0.3) {
+                        targetScrollX += (closestIdealScroll - targetScrollX) * 0.08;
+                    }
+                }
+
                 currentScrollX += (targetScrollX - currentScrollX) * 0.1;
                 
                 const velocity = currentScrollX - lastScrollX;
                 lastScrollX = currentScrollX;
-                const skewAmt = Math.max(-15, Math.min(15, velocity * -0.2));
+                const skewAmt = Math.max(-25, Math.min(25, velocity * -0.3));
 
                 trackRef.current.style.transform = `translate3d(${-currentScrollX}px, 0, 0)`;
                 
-                // apply skew to children
+                // Apply skew and physical scale to children
                 const nodes = trackRef.current.querySelectorAll('.helix-node') as NodeListOf<HTMLElement>;
+                const viewportCenter = currentScrollX + window.innerWidth / 2;
+                
                 nodes.forEach(node => {
-                    const existingTransform = node.style.transform.replace(/skewX\([^)]*\)/g, '').replace(/perspective\(1000px\)/g, '').trim();
-                    node.style.transform = `perspective(1000px) skewX(${skewAmt}deg) ${existingTransform}`;
+                    const nodeCenter = node.offsetLeft + node.offsetWidth / 2;
+                    const distFromCenter = Math.abs(nodeCenter - viewportCenter);
+                    
+                    // Magnetic bulging effect near the center
+                    const magneticScale = Math.max(0.85, 1.1 - (distFromCenter / (window.innerWidth * 0.5)) * 0.25);
+                    
+                    const existingTransform = node.style.transform
+                        .replace(/skewX\([^)]*\)/g, '')
+                        .replace(/perspective\([^)]*\)/g, '')
+                        .replace(/scale\([^)]*\)/g, '')
+                        .trim();
+                        
+                    node.style.transform = `perspective(1000px) scale(${magneticScale}) skewX(${skewAmt}deg) ${existingTransform}`;
                 });
             }
             animationFrameId = requestAnimationFrame(renderLoop);
@@ -107,10 +145,16 @@ export default function HelixArchive() {
             gsap.fromTo(rightPanel, { x: '100%' }, { x: '0%', duration: 0.8, ease: "power4.out", delay: 0.1 });
             
             const data = gameData[index];
+            setTitle(data.title);
             
+            if (titleRef.current) {
+                gsap.set(titleRef.current.children, { y: '110%' });
+            }
+
             // Decrypt text effect
             const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()_+-=[]{}|;:,.<>?";
             const decrypt = (finalString: string, setFn: (val: string) => void, duration: number = 1500) => {
+                const random = mulberry32(stringToSeed(data.id));
                 let iterations = 0;
                 const maxIterations = finalString.length * 2;
                 const intervalDuration = duration / maxIterations;
@@ -119,7 +163,7 @@ export default function HelixArchive() {
                     setFn(finalString.split('').map((char, index) => {
                         if (index < iterations / 2) return char;
                         if (char === ' ') return ' ';
-                        return chars[Math.floor(Math.random() * chars.length)];
+                        return chars[Math.floor(random() * chars.length)];
                     }).join(''));
     
                     if (iterations >= maxIterations) {
@@ -131,7 +175,9 @@ export default function HelixArchive() {
             };
 
             setTimeout(() => {
-                decrypt(data.title, setTitle, 800);
+                if (titleRef.current) {
+                    gsap.to(titleRef.current.children, { y: '0%', duration: 0.6, ease: "power4.out" });
+                }
                 setTimeout(() => decrypt(data.text, setBody, 2000), 400);
             }, 600);
         }
@@ -169,7 +215,11 @@ export default function HelixArchive() {
 
         const data = gameData[currentHelixIndex];
         const utterance = new SpeechSynthesisUtterance(data.audio);
-        utterance.pitch = 0.9; utterance.rate = 1.1; 
+        
+        const maleVoice = getMaleVoice();
+        if (maleVoice) utterance.voice = maleVoice;
+
+        utterance.pitch = 0.8; utterance.rate = 1.0; 
         
         utterance.onstart = () => setIsPlaying(true);
         utterance.onend = () => setIsPlaying(false);
@@ -204,7 +254,7 @@ export default function HelixArchive() {
                                     const rotateY = ((x - centerX) / centerX) * 15;
 
                                     const currentTransform = e.currentTarget.style.transform;
-                                    const skewMatch = currentTransform.match(/skewX\([^)]*\)/);
+                                    const skewMatch = currentTransform.match(/skewX\\([^)]*\\)/);
                                     const skewPart = skewMatch ? skewMatch[0] : '';
                                     
                                     gsap.to(e.currentTarget, {
@@ -234,7 +284,12 @@ export default function HelixArchive() {
                 <div className="detail-panel detail-left">
                     <div id="detail-icon" className="text-white opacity-10 mb-8 w-24 h-24" dangerouslySetInnerHTML={{ __html: svgHelix }}></div>
                     <div className="mono text-gray-400 tracking-[0.4em] text-xl mb-4">ER // {gameData[currentHelixIndex]?.era}</div>
-                    <h1 className="cinzel text-5xl md:text-8xl font-bold text-white mb-4 leading-none">{title || gameData[currentHelixIndex]?.title}</h1>
+                    
+                    {/* Cinematic Typography Mask */}
+                    <h1 className="cinzel text-5xl md:text-8xl font-bold text-white mb-4 leading-none line-mask" ref={titleRef}>
+                        <span>{title || gameData[currentHelixIndex]?.title}</span>
+                    </h1>
+                    
                     <h2 className="mono text-2xl md:text-4xl text-[var(--abstergo-blue)] tracking-widest">{gameData[currentHelixIndex]?.subtitle}</h2>
                 </div>
                 
