@@ -1,309 +1,179 @@
 'use client';
-import { useEffect, useRef } from 'react';
+import { useRef, useEffect, useState, useMemo } from 'react';
+import { Canvas, useFrame, useThree, extend } from '@react-three/fiber';
+import { Points, PointMaterial, Effects } from '@react-three/drei';
 import * as THREE from 'three';
-import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
-import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
-import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
-import { FilmPass } from 'three/examples/jsm/postprocessing/FilmPass.js';
+import { UnrealBloomPass } from 'three-stdlib';
 import gsap from 'gsap';
 import { useAppContext, APP_STATE } from '@/context/AppContext';
 
-export default function WebGLBackground() {
-    const { currentState } = useAppContext();
-    const containerRef = useRef<HTMLDivElement>(null);
-    const sceneRef = useRef<THREE.Scene | null>(null);
-    const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
-    const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
-    const composerRef = useRef<EffectComposer | null>(null);
-    const particlesRef = useRef<THREE.Points | null>(null);
-    const materialRef = useRef<THREE.PointsMaterial | null>(null);
-    const bloomRef = useRef<UnrealBloomPass | null>(null);
+declare module '@react-three/fiber' {
+    interface ThreeElements {
+        unrealBloomPass: any;
+    }
+}
+
+extend({ UnrealBloomPass });
+
+// Custom performance governor
+function usePerformanceGovernor(maxParticles: number) {
+    const [qualityTier, setQualityTier] = useState(2); // 0=low, 1=med, 2=high
+    const frameData = useRef({ smoothedMs: 16.7, poorFrames: 0, strongFrames: 0 });
+
+    useFrame((state, delta) => {
+        const ms = delta * 1000;
+        frameData.current.smoothedMs += (ms - frameData.current.smoothedMs) * 0.05;
+        const { smoothedMs } = frameData.current;
+
+        if (smoothedMs > 24) frameData.current.poorFrames++;
+        else frameData.current.poorFrames = 0;
+
+        if (smoothedMs < 15) frameData.current.strongFrames++;
+        else frameData.current.strongFrames = 0;
+
+        if (frameData.current.poorFrames > 90 && qualityTier > 0) {
+            setQualityTier(q => Math.max(0, q - 1));
+            frameData.current.poorFrames = 0;
+        } else if (frameData.current.strongFrames > 360 && qualityTier < 2) {
+            setQualityTier(q => Math.min(2, q + 1));
+            frameData.current.strongFrames = 0;
+        }
+    });
+
+    return qualityTier === 2 ? maxParticles : qualityTier === 1 ? Math.floor(maxParticles * 0.5) : Math.floor(maxParticles * 0.25);
+}
+
+function ParticleField({ appState, isReducedMotion }: { appState: APP_STATE, isReducedMotion: boolean }) {
+    const ref = useRef<THREE.Points>(null);
+    const particleCount = usePerformanceGovernor(isReducedMotion ? 5000 : 20000);
     
-    // Performance governor state
-    const governorRef = useRef({
-        lastTime: 0,
-        smoothedMs: 16.7,
-        poorFrames: 0,
-        strongFrames: 0,
-        qualityTier: 2, // 0 = low, 1 = med, 2 = high
-        maxParticles: 20000,
-        currentParticles: 20000
-    });
-
-    // Animation states
-    const animState = useRef({
-        time: 0,
-        speed: 1,
-        mouseX: 0,
-        mouseY: 0,
-        targetX: 0,
-        targetY: 0,
-        cameraTargetZ: 50,
-        isHelixWorld: false,
-        isTransitioningToHelix: false
-    });
-
-    useEffect(() => {
-        if (!containerRef.current) return;
-        
-        // Reduced motion & performance capability
-        const isReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-        const hwConcurrency = navigator.hardwareConcurrency || 4;
-        const isHighEnd = hwConcurrency > 4 && !isReducedMotion;
-        
-        // Initialize Three.js
-        const scene = new THREE.Scene();
-        scene.fog = new THREE.FogExp2(0x010a0f, 0.002);
-        sceneRef.current = scene;
-
-        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
-        camera.position.z = 50;
-        cameraRef.current = camera;
-
-        const renderer = new THREE.WebGLRenderer({ antialias: false, alpha: true, powerPreference: "high-performance" });
-        renderer.setSize(window.innerWidth, window.innerHeight);
-        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-        containerRef.current.appendChild(renderer.domElement);
-        rendererRef.current = renderer;
-
-        // Post-Processing
-        const composer = new EffectComposer(renderer);
-        composer.addPass(new RenderPass(scene, camera));
-        
-        const bloomPass = new UnrealBloomPass(
-            new THREE.Vector2(window.innerWidth, window.innerHeight),
-            isHighEnd ? 1.5 : 0.8, // strength
-            0.4, // radius
-            0.85 // threshold
-        );
-        composer.addPass(bloomPass);
-        bloomRef.current = bloomPass;
-
-        const filmPass = new FilmPass(
-            isHighEnd ? 0.35 : 0.15, // noise intensity
-            false // grayscale
-        );
-        composer.addPass(filmPass);
-        
-        composerRef.current = composer;
-
-        // Particle System
-        const maxParticles = isHighEnd ? 20000 : 5000;
-        governorRef.current.maxParticles = maxParticles;
-        governorRef.current.currentParticles = maxParticles;
-        governorRef.current.qualityTier = isHighEnd ? 2 : 1;
-
-        const geometry = new THREE.BufferGeometry();
-        const positions = new Float32Array(maxParticles * 3);
-        const originalPositions = new Float32Array(maxParticles * 3);
-        const randoms = new Float32Array(maxParticles);
-        
-        for (let i = 0; i < maxParticles; i++) {
+    const [positions, originalPositions] = useMemo(() => {
+        const pos = new Float32Array(20000 * 3);
+        const orig = new Float32Array(20000 * 3);
+        for (let i = 0; i < 20000; i++) {
             const r = 20 + Math.random() * 40;
             const theta = Math.random() * Math.PI * 2;
             const z = (Math.random() - 0.5) * 400;
-            
-            positions[i * 3] = r * Math.cos(theta);
-            positions[i * 3 + 1] = r * Math.sin(theta);
-            positions[i * 3 + 2] = z;
-
-            originalPositions[i * 3] = positions[i * 3];
-            originalPositions[i * 3 + 1] = positions[i * 3 + 1];
-            originalPositions[i * 3 + 2] = positions[i * 3 + 2];
-            
-            randoms[i] = Math.random();
+            pos[i * 3] = r * Math.cos(theta);
+            pos[i * 3 + 1] = r * Math.sin(theta);
+            pos[i * 3 + 2] = z;
+            orig[i * 3] = pos[i * 3];
+            orig[i * 3 + 1] = pos[i * 3 + 1];
+            orig[i * 3 + 2] = pos[i * 3 + 2];
         }
-
-        geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-        geometry.setAttribute('aOriginalPosition', new THREE.BufferAttribute(originalPositions, 3));
-        geometry.setAttribute('aRandom', new THREE.BufferAttribute(randoms, 1));
-
-        const material = new THREE.PointsMaterial({
-            size: 0.8,
-            color: 0x00e5ff,
-            transparent: true,
-            opacity: 0.6,
-            blending: THREE.AdditiveBlending,
-            depthWrite: false
-        });
-        materialRef.current = material;
-
-        const particles = new THREE.Points(geometry, material);
-        scene.add(particles);
-        particlesRef.current = particles;
-
-        // Resize
-        const handleResize = () => {
-            if (!camera || !renderer) return;
-            camera.aspect = window.innerWidth / window.innerHeight;
-            camera.updateProjectionMatrix();
-            renderer.setSize(window.innerWidth, window.innerHeight);
-            composer.setSize(window.innerWidth, window.innerHeight);
-        };
-        window.addEventListener('resize', handleResize);
-
-        // Mouse Move
-        const handleMouseMove = (e: MouseEvent) => {
-            const state = animState.current;
-            if (state.isHelixWorld) {
-                state.targetX = (e.clientX - window.innerWidth / 2) * 0.05;
-                state.targetY = (e.clientY - window.innerHeight / 2) * 0.05;
-            } else {
-                state.targetX = (e.clientX - window.innerWidth / 2) * 0.02;
-                state.targetY = (e.clientY - window.innerHeight / 2) * 0.02;
-            }
-        };
-        window.addEventListener('mousemove', handleMouseMove);
-
-        // Render loop
-        let animationFrameId: number;
-        const renderLoop = (time: number) => {
-            const gov = governorRef.current;
-            if (gov.lastTime) {
-                const deltaMs = time - gov.lastTime;
-                gov.smoothedMs += (deltaMs - gov.smoothedMs) * 0.05;
-                
-                // Adaptive governor logic
-                gov.poorFrames = gov.smoothedMs > 24 ? gov.poorFrames + 1 : 0;
-                gov.strongFrames = gov.smoothedMs < 15 ? gov.strongFrames + 1 : 0;
-
-                if (gov.poorFrames > 90 && gov.qualityTier > 0) {
-                    gov.qualityTier--;
-                    gov.poorFrames = 0; // cooldown
-                    gov.currentParticles = Math.floor(gov.maxParticles * (gov.qualityTier === 1 ? 0.5 : 0.25));
-                    if (particlesRef.current) particlesRef.current.geometry.setDrawRange(0, gov.currentParticles);
-                }
-                if (gov.strongFrames > 360 && gov.qualityTier < 2) {
-                    gov.qualityTier++;
-                    gov.strongFrames = 0; // cooldown
-                    gov.currentParticles = Math.floor(gov.maxParticles * (gov.qualityTier === 2 ? 1 : 0.5));
-                    if (particlesRef.current) particlesRef.current.geometry.setDrawRange(0, gov.currentParticles);
-                }
-            }
-            gov.lastTime = time;
-
-            const state = animState.current;
-            state.time += 0.002 * state.speed;
-            state.mouseX += (state.targetX - state.mouseX) * 0.05;
-            state.mouseY += (state.targetY - state.mouseY) * 0.05;
-
-            camera.position.x = state.mouseX;
-            camera.position.y = -state.mouseY;
-            camera.position.z += (state.cameraTargetZ - camera.position.z) * 0.05;
-            camera.lookAt(0, 0, 0);
-
-            if (particles) {
-                if (state.isTransitioningToHelix) {
-                    particles.rotation.z += 0.05;
-                    particles.scale.x += 0.02;
-                    particles.scale.y += 0.02;
-                } else if (state.isHelixWorld) {
-                    particles.rotation.y = state.time * 0.2;
-                    particles.rotation.z = state.time * 0.1;
-                    
-                    const positions = particles.geometry.attributes.position.array as Float32Array;
-                    const originals = particles.geometry.attributes.aOriginalPosition.array as Float32Array;
-                    
-                    const drawLimit = gov.currentParticles;
-                    for (let i = 0; i < drawLimit; i++) {
-                        const i3 = i * 3;
-                        const t = state.time + originals[i3+2] * 0.01;
-                        const r = 30;
-                        const offset = (i % 2 === 0) ? 0 : Math.PI;
-                        
-                        const targetX = Math.sin(t + offset) * r;
-                        const targetY = originals[i3+1] * 0.1; 
-                        const targetZ = originals[i3+2];
-                        
-                        if (i % 100 < 5) {
-                            positions[i3] += (Math.cos(t) * r * (Math.random()-0.5) - positions[i3]) * 0.1;
-                        } else {
-                            positions[i3] += (targetX - positions[i3]) * 0.05;
-                        }
-                        positions[i3+1] += (targetY - positions[i3+1]) * 0.05;
-                        positions[i3+2] += (targetZ - positions[i3+2]) * 0.05;
-                    }
-                    particles.geometry.attributes.position.needsUpdate = true;
-                } else {
-                    particles.rotation.z = state.time * 0.5;
-                }
-            }
-            
-            // Dynamic Bloom Strength based on speed and tier
-            if (bloomPass) {
-                const baseStrength = gov.qualityTier === 2 ? 1.5 : gov.qualityTier === 1 ? 1.0 : 0.5;
-                bloomPass.strength = baseStrength + (state.speed * 0.1);
-            }
-
-            composer.render();
-            animationFrameId = requestAnimationFrame(renderLoop);
-        };
-        animationFrameId = requestAnimationFrame(renderLoop);
-
-        return () => {
-            window.removeEventListener('resize', handleResize);
-            window.removeEventListener('mousemove', handleMouseMove);
-            cancelAnimationFrame(animationFrameId);
-            
-            geometry.dispose();
-            material.dispose();
-            renderer.dispose();
-            composer.dispose();
-            if (containerRef.current?.contains(renderer.domElement)) {
-                containerRef.current.removeChild(renderer.domElement);
-            }
-        };
+        return [pos, orig];
     }, []);
+
+    const animState = useRef({ time: 0, speed: 1, isHelix: false, color: new THREE.Color('#00e5ff') });
 
     useEffect(() => {
         const state = animState.current;
-        const isReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-        
-        switch(currentState) {
-            case APP_STATE.LORE:
-                gsap.to(state, { speed: 20, duration: 0.5, yoyo: true, repeat: 1 });
-                break;
-            case APP_STATE.TRANSITION:
-                state.isTransitioningToHelix = true;
-                if (cameraRef.current && !isReducedMotion) {
-                    gsap.to(cameraRef.current.position, {
-                        x: () => (Math.random() - 0.5) * 50,
-                        y: () => (Math.random() - 0.5) * 50,
-                        duration: 0.1, yoyo: true, repeat: 20
-                    });
-                }
-                break;
-            case APP_STATE.HELIX:
-                state.isTransitioningToHelix = false;
-                state.isHelixWorld = true;
-                
-                if (materialRef.current) {
-                    gsap.to(materialRef.current.color, { r: 1, g: 1, b: 1, duration: 2 });
-                }
-                if (sceneRef.current?.fog) {
-                    sceneRef.current.fog = new THREE.FogExp2(0x001e3c, 0.002);
-                }
-                if (particlesRef.current) {
-                    gsap.to(particlesRef.current.scale, { x: 1, y: 1, z: 1, duration: 1, ease: "power2.out" });
-                }
-                if (bloomRef.current) {
-                    gsap.to(bloomRef.current, { strength: 2.5, duration: 1, ease: "power2.out" });
-                }
-                break;
-            case APP_STATE.DEEPDIVE:
-                state.cameraTargetZ = -150;
-                if (cameraRef.current && !isReducedMotion) {
-                    gsap.to(cameraRef.current.rotation, { z: Math.PI * 2, duration: 2, ease: "power3.inOut" });
-                }
-                break;
+        if (appState === APP_STATE.LORE) {
+            gsap.to(state, { speed: 15, duration: 1, yoyo: true, repeat: 1, ease: 'power2.inOut' });
+            state.isHelix = false;
+        } else if (appState === APP_STATE.HELIX) {
+            state.isHelix = true;
+            gsap.to(state.color, { r: 1, g: 1, b: 1, duration: 2 });
         }
-    }, [currentState]);
+    }, [appState]);
+
+    useFrame((state, delta) => {
+        if (!ref.current) return;
+        const anim = animState.current;
+        anim.time += delta * 0.2 * anim.speed;
+        
+        // Update color
+        const mat = ref.current.material as THREE.PointsMaterial;
+        mat.color.copy(anim.color);
+
+        if (anim.isHelix) {
+            ref.current.rotation.y = anim.time;
+            ref.current.rotation.z = anim.time * 0.5;
+            
+            // Complex geometry deformation
+            const pos = ref.current.geometry.attributes.position.array as Float32Array;
+            for (let i = 0; i < particleCount; i++) {
+                const i3 = i * 3;
+                const t = anim.time + originalPositions[i3+2] * 0.01;
+                const r = 30;
+                const offset = (i % 2 === 0) ? 0 : Math.PI;
+                const targetX = Math.sin(t + offset) * r;
+                pos[i3] += (targetX - pos[i3]) * 0.05;
+                pos[i3+1] += (originalPositions[i3+1] * 0.1 - pos[i3+1]) * 0.05;
+                pos[i3+2] += (originalPositions[i3+2] - pos[i3+2]) * 0.05;
+            }
+            ref.current.geometry.attributes.position.needsUpdate = true;
+        } else {
+            ref.current.rotation.z = anim.time;
+        }
+        
+        // Limit drawn particles based on governor
+        ref.current.geometry.setDrawRange(0, particleCount);
+    });
+
+    return (
+        <Points ref={ref} positions={positions} stride={3} frustumCulled={false}>
+            <PointMaterial transparent color="#00e5ff" size={0.8} sizeAttenuation={true} depthWrite={false} blending={THREE.AdditiveBlending} opacity={0.6} />
+        </Points>
+    );
+}
+
+function SceneChoreography({ appState, isReducedMotion }: { appState: APP_STATE, isReducedMotion: boolean }) {
+    const { camera, mouse } = useThree();
+    const target = useRef(new THREE.Vector3(0, 0, 50));
+
+    useEffect(() => {
+        if (appState === APP_STATE.DEEPDIVE) {
+            target.current.z = -150;
+            if (!isReducedMotion) {
+                gsap.to(camera.rotation, { z: Math.PI * 2, duration: 2, ease: "power3.inOut" });
+            }
+        } else {
+            target.current.z = 50;
+            gsap.to(camera.rotation, { z: 0, duration: 1, ease: "power2.out" });
+        }
+    }, [appState, camera, isReducedMotion]);
+
+    useFrame((state) => {
+        // Pointer parallax
+        const parallaxStrength = appState === APP_STATE.HELIX ? 5 : 2;
+        target.current.x = mouse.x * parallaxStrength;
+        target.current.y = mouse.y * parallaxStrength;
+        
+        camera.position.lerp(target.current, 0.05);
+        camera.lookAt(0, 0, 0);
+    });
+
+    return null;
+}
+
+export default function WebGLBackground() {
+    const { currentState } = useAppContext();
+    const [isReducedMotion, setIsReducedMotion] = useState(false);
+
+    useEffect(() => {
+        setIsReducedMotion(window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+    }, []);
 
     return (
         <>
-            <div id="webgl-container" ref={containerRef} className="fixed inset-0 z-[1]"></div>
-            <div className="scanlines fixed inset-0 z-[50] pointer-events-none opacity-30" style={{ background: 'linear-gradient(to bottom, rgba(255,255,255,0), rgba(255,255,255,0) 50%, rgba(0,0,0,0.2) 50%, rgba(0,0,0,0.2))', backgroundSize: '100% 4px' }}></div>
-            <div className="vignette fixed inset-0 z-[49] pointer-events-none" style={{ background: 'radial-gradient(circle at center, transparent 30%, #000 120%)' }}></div>
+            <div className="fixed inset-0 z-[1] bg-black">
+                <Canvas gl={{ antialias: false, powerPreference: "high-performance", alpha: false }} dpr={[1, 1.5]}>
+                    <color attach="background" args={[currentState === APP_STATE.HELIX ? '#001e3c' : '#010a0f']} />
+                    <fogExp2 attach="fog" args={[currentState === APP_STATE.HELIX ? '#001e3c' : '#010a0f', 0.002]} />
+                    
+                    <ParticleField appState={currentState} isReducedMotion={isReducedMotion} />
+                    <SceneChoreography appState={currentState} isReducedMotion={isReducedMotion} />
+                    
+                    {/* Post Processing: Bloom */}
+                    <Effects disableGamma>
+                        <unrealBloomPass threshold={0.85} strength={currentState === APP_STATE.HELIX ? 2.5 : 1.2} radius={0.4} />
+                    </Effects>
+                </Canvas>
+            </div>
+            {/* Cinematic overlays (Grain/Scanlines) */}
+            <div className="fixed inset-0 z-[50] pointer-events-none opacity-[0.15] mix-blend-overlay bg-[url('https://upload.wikimedia.org/wikipedia/commons/7/76/1k_Dissolve_Noise_Texture.png')] bg-repeat" />
+            <div className="fixed inset-0 z-[49] pointer-events-none" style={{ background: 'radial-gradient(circle at center, transparent 30%, #000 120%)' }}></div>
         </>
     );
 }
